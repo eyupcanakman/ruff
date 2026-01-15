@@ -122,6 +122,7 @@ mod named_tuple;
 mod paramspec_validation;
 mod subscript;
 mod type_expression;
+mod typed_dict;
 mod typevar;
 
 use super::comparisons::{self, BinaryComparisonVisitor};
@@ -214,6 +215,10 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
 
     /// The types of every expression in this region.
     expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
+
+    /// Type qualifiers (`Required`, `NotRequired`, etc.) for annotation expressions.
+    /// Only populated for expressions that have non-empty qualifiers.
+    qualifiers: FxHashMap<ExpressionNodeKey, TypeQualifiers>,
 
     /// Expressions that are string annotations
     string_annotations: FxHashSet<ExpressionNodeKey>,
@@ -334,6 +339,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             multi_inference_state: MultiInferenceState::Panic,
             inner_expression_inference_state: InnerExpressionInferenceState::Infer,
             expressions: FxHashMap::default(),
+            qualifiers: FxHashMap::default(),
             string_annotations: FxHashSet::default(),
             bindings: VecMap::default(),
             declarations: VecMap::default(),
@@ -370,6 +376,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         assert_eq!(self.scope, inference.scope);
 
         self.expressions.extend(inference.expressions.iter());
+        self.qualifiers.extend(inference.qualifiers.iter());
         self.declarations
             .extend(inference.declarations(), self.multi_inference_state);
 
@@ -557,6 +564,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             .get(&expr.into())
             .copied()
             .or(self.fallback_type())
+    }
+
+    /// Store qualifiers for an annotation expression.
+    fn store_qualifiers(&mut self, expr: &ast::Expr, qualifiers: TypeQualifiers) {
+        if !qualifiers.is_empty() {
+            self.qualifiers.insert(expr.into(), qualifiers);
+        }
     }
 
     /// Get the type of an expression from any scope in the same file.
@@ -2838,6 +2852,9 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                             Some(definition),
                             namedtuple_kind,
                         )
+                    } else if matches!(callable_type, Type::SpecialForm(SpecialFormType::TypedDict))
+                    {
+                        self.infer_typeddict_call_expression(call_expr, Some(definition))
                     } else {
                         match callable_type
                             .as_class_literal()
@@ -3006,7 +3023,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     }
 
     fn infer_assignment_deferred(&mut self, target: &ast::Expr, value: &'ast ast::Expr) {
-        // Infer deferred bounds/constraints/defaults of a legacy TypeVar / ParamSpec / NewType.
+        // Infer deferred bounds/constraints/defaults of a legacy TypeVar / ParamSpec / NewType,
+        // and field types for functional TypedDict.
         let ast::Expr::Call(ast::ExprCall {
             func, arguments, ..
         }) = value
@@ -3039,6 +3057,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 return;
             }
             _ => {}
+        }
+        // Check for functional TypedDict calls using SpecialFormType
+        if matches!(func_ty, Type::SpecialForm(SpecialFormType::TypedDict)) {
+            self.infer_functional_typeddict_deferred(arguments);
+            return;
         }
         let mut constraint_tys = Vec::new();
         for arg in arguments.args.iter().skip(1) {
@@ -4068,17 +4091,8 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 TypeQualifiers::REQUIRED | TypeQualifiers::NOT_REQUIRED | TypeQualifiers::READ_ONLY,
             ) {
                 let in_typed_dict = current_scope.kind() == ScopeKind::Class
-                    && nearest_enclosing_class(self.db(), self.index, self.scope()).is_some_and(
-                        |class| {
-                            class.iter_mro(self.db(), None).any(|base| {
-                                matches!(
-                                    base,
-                                    ClassBase::TypedDict
-                                        | ClassBase::Dynamic(DynamicType::TodoFunctionalTypedDict)
-                                )
-                            })
-                        },
-                    );
+                    && nearest_enclosing_class(self.db(), self.index, self.scope())
+                        .is_some_and(|class| class.is_typed_dict(self.db()));
                 if !in_typed_dict {
                     for qualifier in [
                         TypeQualifiers::REQUIRED,
@@ -5789,57 +5803,78 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut item_types = FxHashMap::default();
 
         // Validate `TypedDict` dictionary literal assignments.
-        if let Some(tcx) = tcx.annotation {
-            let tcx = tcx.filter_union(self.db(), Type::is_typed_dict);
-
-            if let Some(typed_dict) = tcx.as_typed_dict() {
+        if let Some(annotation) = tcx
+            .annotation
+            .map(|annotation| annotation.resolve_type_alias(self.db()))
+        {
+            if let Some(typed_dict) = annotation.as_typed_dict() {
                 // If there is a single typed dict annotation, infer against it directly.
                 if let Some(ty) =
                     self.infer_typed_dict_expression(dict, typed_dict, &mut item_types)
                 {
                     return ty;
                 }
-            } else if let Type::Union(tcx) = tcx {
-                // Otherwise, we have to narrow to specific elements of the union.
-                //
-                // Infer all expressions with diagnostics enabled before starting multi-inference.
-                for item in items {
-                    if let Some(key) = item.key.as_ref() {
-                        let key_ty = self.infer_expression(key, TypeContext::default());
-                        item_types.insert(key.node_index().load(), key_ty);
-                    }
+            } else if let Type::Union(union) = annotation {
+                let union_elements = union.elements(self.db());
+                let typed_dicts = union_elements
+                    .iter()
+                    .filter_map(|element| element.as_typed_dict())
+                    .collect_vec();
+                let has_dict_compatible_fallback = union_elements.iter().any(|element| {
+                    !element.is_typed_dict()
+                        && !element
+                            .is_disjoint_from(self.db(), KnownClass::Dict.to_instance(self.db()))
+                });
 
-                    let value_ty = self.infer_expression(&item.value, TypeContext::default());
-                    item_types.insert(item.value.node_index().load(), value_ty);
-                }
-
-                // Disable diagnostics as we attempt to narrow to specific elements of the union.
-                let old_multi_inference = self.context.set_multi_inference(true);
-                let old_multi_inference_state =
-                    self.set_multi_inference_state(MultiInferenceState::Ignore);
-
-                let mut narrowed_tys = Vec::new();
-                let mut item_types = FxHashMap::default();
-                for element in tcx.elements(self.db()) {
-                    let typed_dict = element
-                        .as_typed_dict()
-                        .expect("filtered out non-typed-dict types above");
-
-                    if let Some(inferred_ty) =
-                        self.infer_typed_dict_expression(dict, typed_dict, &mut item_types)
+                if let [typed_dict] = typed_dicts.as_slice()
+                    && !has_dict_compatible_fallback
+                {
+                    if let Some(ty) =
+                        self.infer_typed_dict_expression(dict, *typed_dict, &mut item_types)
                     {
-                        narrowed_tys.push(inferred_ty);
+                        return ty;
+                    }
+                } else if !typed_dicts.is_empty() {
+                    // Infer all expressions with diagnostics enabled before starting
+                    // multi-inference. This preserves the general expression types even if we later
+                    // fall back to a non-`TypedDict` arm of the union.
+                    for item in items {
+                        if let Some(key) = item.key.as_ref() {
+                            let key_ty = self.infer_expression(key, TypeContext::default());
+                            item_types.insert(key.node_index().load(), key_ty);
+                        }
+
+                        let value_ty = self.infer_expression(&item.value, TypeContext::default());
+                        item_types.insert(item.value.node_index().load(), value_ty);
                     }
 
-                    item_types.clear();
-                }
+                    // Disable diagnostics as we attempt to narrow to specific `TypedDict`
+                    // elements of the union. Mixed unions like `TypedDict | dict[str, Any]`
+                    // should not emit `TypedDict` diagnostics if a non-`TypedDict` arm accepts
+                    // the literal.
+                    let old_multi_inference = self.context.set_multi_inference(true);
+                    let old_multi_inference_state =
+                        self.set_multi_inference_state(MultiInferenceState::Ignore);
 
-                self.context.set_multi_inference(old_multi_inference);
-                self.set_multi_inference_state(old_multi_inference_state);
+                    let mut narrowed_tys = Vec::new();
+                    let mut item_types = FxHashMap::default();
+                    for typed_dict in typed_dicts {
+                        if let Some(inferred_ty) =
+                            self.infer_typed_dict_expression(dict, typed_dict, &mut item_types)
+                        {
+                            narrowed_tys.push(inferred_ty);
+                        }
 
-                // Successfully narrowed to a subset of typed dicts.
-                if !narrowed_tys.is_empty() {
-                    return UnionType::from_elements(self.db(), narrowed_tys);
+                        item_types.clear();
+                    }
+
+                    self.context.set_multi_inference(old_multi_inference);
+                    self.set_multi_inference_state(old_multi_inference_state);
+
+                    // Successfully narrowed to a subset of typed dicts.
+                    if !narrowed_tys.is_empty() {
+                        return UnionType::from_elements(self.db(), narrowed_tys);
+                    }
                 }
             }
         }
@@ -6878,6 +6913,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return self.infer_namedtuple_call_expression(call_expression, None, namedtuple_kind);
         }
 
+        // Handle `TypedDict(name, fields)`.
+        if matches!(callable_type, Type::SpecialForm(SpecialFormType::TypedDict)) {
+            return self.infer_typeddict_call_expression(call_expression, None);
+        }
+
         // We don't call `Type::try_call`, because we want to perform type inference on the
         // arguments after matching them to parameters, but before checking that the argument types
         // are assignable to any parameter annotations.
@@ -7156,7 +7196,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
         // Validate `TypedDict` constructor calls after argument type inference.
         if let Some(class) = class
-            && class.class_literal(self.db()).is_typed_dict(self.db())
+            && class.is_typed_dict(self.db())
         {
             validate_typed_dict_constructor(
                 &self.context,
@@ -8807,6 +8847,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Self {
             context,
             mut expressions,
+            qualifiers: _,
             string_annotations,
             scope,
             bindings,
@@ -8879,6 +8920,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let Self {
             context,
             mut expressions,
+            mut qualifiers,
             string_annotations,
             scope,
             bindings,
@@ -8941,9 +8983,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         expressions.shrink_to_fit();
+        qualifiers.shrink_to_fit();
 
         DefinitionInference {
             expressions,
+            qualifiers,
             #[cfg(debug_assertions)]
             scope,
             bindings: bindings.into_boxed_slice(),
@@ -8966,6 +9010,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             deferred: _,
             bindings: _,
             declarations: _,
+            qualifiers: _,
 
             // Ignored; only relevant to definition regions
             undecorated_type: _,
@@ -9040,6 +9085,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             index: _,
             region: _,
             return_types_and_ranges: _,
+            qualifiers: _,
         } = other;
 
         let diagnostics = context.finish();
@@ -9635,7 +9681,7 @@ impl<'db, 'ast> AddBinding<'db, 'ast> {
     /// necessarily guarantee that the passed-in value for `__setitem__` is stored and
     /// can be retrieved unmodified via `__getitem__`. Therefore, we currently only
     /// perform assignment-based narrowing on a few built-in classes (`list`, `dict`,
-    /// `bytesarray`, `TypedDict` and `collections` types) where we are confident that
+    /// `bytesarray`, `TypedDict`, and `collections` types) where we are confident that
     /// this kind of narrowing can be performed soundly. This is the same approach as
     /// pyright. TODO: Other standard library classes may also be considered safe. Also,
     /// subclasses of these safe classes that do not override `__getitem__/__setitem__`
