@@ -617,7 +617,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         self,
         db: &'db dyn Db,
         builder: &'c ConstraintSetBuilder<'db>,
-    ) -> Solutions<Ref<'c, Vec<Solution<'db>>>> {
+    ) -> Solutions<'db> {
         self.verify_builder(builder);
 
         // If the constraint set is cyclic, we'll hit an infinite expansion when trying to add type
@@ -648,7 +648,7 @@ impl<'db, 'c> ConstraintSet<'db, 'c> {
         builder: &'c ConstraintSetBuilder<'db>,
         inferable: InferableTypeVars<'_, 'db>,
         choose: impl FnMut(BoundTypeVarInstance<'db>, Type<'db>, Type<'db>) -> Option<Type<'db>>,
-    ) -> Solutions<Vec<Solution<'db>>> {
+    ) -> Solutions<'db> {
         self.verify_builder(builder);
 
         if self.is_cyclic_impl(db, Some(inferable)) {
@@ -744,7 +744,6 @@ struct ConstraintSetStorage<'db> {
     exists_one_cache: FxHashMap<(NodeId, BoundTypeVarIdentity<'db>), NodeId>,
     retain_one_cache: FxHashMap<(NodeId, BoundTypeVarIdentity<'db>), NodeId>,
     restrict_one_cache: FxHashMap<(NodeId, ConstraintAssignment), (NodeId, bool)>,
-    solutions_cache: FxHashMap<NodeId, Vec<Solution<'db>>>,
     simplify_cache: FxHashMap<NodeId, NodeId>,
 
     single_sequent_cache: FxHashMap<ConstraintId, SequentMap>,
@@ -1770,11 +1769,11 @@ impl NodeId {
         }
     }
 
-    fn solutions<'db, 'c>(
+    fn solutions<'db>(
         self,
         db: &'db dyn Db,
-        builder: &'c ConstraintSetBuilder<'db>,
-    ) -> Solutions<Ref<'c, Vec<Solution<'db>>>> {
+        builder: &ConstraintSetBuilder<'db>,
+    ) -> Solutions<'db> {
         match self.node() {
             Node::AlwaysTrue => Solutions::Unconstrained,
             Node::AlwaysFalse => Solutions::Unsatisfiable,
@@ -1788,7 +1787,7 @@ impl NodeId {
         builder: &ConstraintSetBuilder<'db>,
         inferable: Option<InferableTypeVars<'_, 'db>>,
         choose: impl FnMut(BoundTypeVarInstance<'db>, Type<'db>, Type<'db>) -> Option<Type<'db>>,
-    ) -> Solutions<Vec<Solution<'db>>> {
+    ) -> Solutions<'db> {
         match self.node() {
             Node::AlwaysTrue => Solutions::Unconstrained,
             Node::AlwaysFalse => Solutions::Unsatisfiable,
@@ -3403,36 +3402,13 @@ impl InteriorNode {
         result
     }
 
-    fn solutions<'db, 'c>(
+    fn solutions<'db>(
         self,
         db: &'db dyn Db,
-        builder: &'c ConstraintSetBuilder<'db>,
-    ) -> Solutions<Ref<'c, Vec<Solution<'db>>>> {
-        fn solutions_inner<'db, 'c>(
-            db: &'db dyn Db,
-            builder: &'c ConstraintSetBuilder<'db>,
-            interior: NodeId,
-        ) -> Ref<'c, Vec<Solution<'db>>> {
-            let key = interior;
-            let storage = builder.storage.borrow();
-            if let Ok(solutions) =
-                Ref::filter_map(storage, |storage| storage.solutions_cache.get(&key))
-            {
-                return solutions;
-            }
-
-            let path_bounds = compute_path_bounds(db, builder, interior);
-            let solutions = solve_paths(db, &path_bounds, default_solve);
-
-            let mut storage = builder.storage.borrow_mut();
-            storage.solutions_cache.insert(key, solutions);
-            drop(storage);
-
-            let storage = builder.storage.borrow();
-            Ref::map(storage, |storage| &storage.solutions_cache[&key])
-        }
-
-        let solutions = solutions_inner(db, builder, self.node());
+        builder: &ConstraintSetBuilder<'db>,
+    ) -> Solutions<'db> {
+        let path_bounds = compute_path_bounds(db, builder, self.node());
+        let solutions = solve_paths(db, &path_bounds, default_solve);
         if solutions.is_empty() {
             return Solutions::Unsatisfiable;
         }
@@ -3445,7 +3421,7 @@ impl InteriorNode {
         builder: &ConstraintSetBuilder<'db>,
         inferable: Option<InferableTypeVars<'_, 'db>>,
         mut choose: impl FnMut(BoundTypeVarInstance<'db>, Type<'db>, Type<'db>) -> Option<Type<'db>>,
-    ) -> Solutions<Vec<Solution<'db>>> {
+    ) -> Solutions<'db> {
         let path_bounds = compute_path_bounds(db, builder, self.node());
         let solutions = solve_paths(db, &path_bounds, |db, bound_typevar, lower, upper| {
             // When filtering by inferable typevars, skip non-inferable ones — they appear
@@ -3918,10 +3894,10 @@ impl InteriorNode {
 /// hook-based solutions use `Vec<Solution<'db>>` (owned, since the hook makes
 /// caching inappropriate).
 #[derive(Debug)]
-pub(crate) enum Solutions<S> {
+pub(crate) enum Solutions<'db> {
     Unsatisfiable,
     Unconstrained,
-    Constrained(S),
+    Constrained(Vec<Solution<'db>>),
 }
 
 pub(crate) type Solution<'db> = Vec<TypeVarSolution<'db>>;

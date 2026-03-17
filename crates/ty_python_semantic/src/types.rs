@@ -1894,7 +1894,7 @@ impl<'db> Type<'db> {
                 match set.solutions(db, constraints) {
                     Solutions::Constrained(solutions) => {
                         let mut mappings = FxHashMap::default();
-                        for solution in solutions.iter() {
+                        for solution in solutions {
                             for binding in solution {
                                 mappings
                                     .entry(binding.bound_typevar.identity(db))
