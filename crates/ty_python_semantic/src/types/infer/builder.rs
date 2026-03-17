@@ -5087,7 +5087,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         debug_assert_eq!(arguments_types.len(), bindings.argument_forms().len());
 
         let db = self.db();
-        let constraints = ConstraintSetBuilder::new();
         let iter = itertools::izip!(
             0..,
             arguments_types.iter_mut(),
@@ -5180,12 +5179,11 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                         let return_ty = overload
                             .constructor_instance_type
                             .unwrap_or(overload.signature.return_ty);
-                        let set = return_ty.when_constraint_set_assignable_to(
-                            db,
-                            declared_return_ty,
-                            &constraints,
-                        );
-                        if let Solutions::Constrained(solutions) = set.solutions(db, &constraints) {
+                        let set = return_ty
+                            .when_constraint_set_assignable_to_owned(db, declared_return_ty);
+                        let solutions =
+                            set.query(|constraints, set| set.solutions(db, constraints));
+                        if let Solutions::Constrained(solutions) = solutions {
                             for solution in solutions {
                                 for binding in solution {
                                     tcx_mappings
@@ -6045,7 +6043,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             return None;
         };
 
-        let constraints = ConstraintSetBuilder::new();
         let inferable = generic_context.inferable_typevars(self.db());
 
         // Remove any union elements of that are unrelated to the collection type.
@@ -6093,8 +6090,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 let db = self.db();
                 let collection_instance = Type::instance(db, ClassType::Generic(collection_alias));
 
-                let set =
-                    collection_instance.when_constraint_set_assignable_to(db, tcx, &constraints);
+                let set = collection_instance.when_constraint_set_assignable_to_owned(db, tcx);
 
                 // Use `solutions_with_inferable` to capture per-typevar variance from the raw
                 // lower/upper bounds on each BDD path. We must use the inferable-aware variant so
@@ -6104,30 +6100,32 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 // `list[T@MyClass]` would create mutual constraints between `_T` (list's typevar)
                 // and `T@MyClass`, which `is_cyclic` would flag as a cycle, returning
                 // `Unsatisfiable` and losing the type context information entirely.
-                let solutions = set.solutions_with_inferable(
-                    db,
-                    &constraints,
-                    inferable,
-                    |typevar, lower, upper| {
-                        // Determine variance from the constraint bounds:
-                        // - Only upper bound (lower = Never) → covariant position
-                        // - Only lower bound (upper = object) → contravariant position
-                        // - Both bounds set → invariant position
-                        let variance = if lower.is_never() {
-                            TypeVarVariance::Covariant
-                        } else if upper == Type::object() {
-                            TypeVarVariance::Contravariant
-                        } else {
-                            TypeVarVariance::Invariant
-                        };
-                        let identity = typevar.identity(db);
-                        elt_tcx_variance
-                            .entry(identity)
-                            .and_modify(|current| *current = current.join(variance))
-                            .or_insert(variance);
-                        None // Use default solution selection
-                    },
-                );
+                let solutions = set.query(|constraints, set| {
+                    set.solutions_with_inferable(
+                        db,
+                        constraints,
+                        inferable,
+                        |typevar, lower, upper| {
+                            // Determine variance from the constraint bounds:
+                            // - Only upper bound (lower = Never) → covariant position
+                            // - Only lower bound (upper = object) → contravariant position
+                            // - Both bounds set → invariant position
+                            let variance = if lower.is_never() {
+                                TypeVarVariance::Covariant
+                            } else if upper == Type::object() {
+                                TypeVarVariance::Contravariant
+                            } else {
+                                TypeVarVariance::Invariant
+                            };
+                            let identity = typevar.identity(db);
+                            elt_tcx_variance
+                                .entry(identity)
+                                .and_modify(|current| *current = current.join(variance))
+                                .or_insert(variance);
+                            None // Use default solution selection
+                        },
+                    )
+                });
 
                 match solutions {
                     // If the type context is not compatible with the collection type (e.g., a
@@ -6186,6 +6184,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         };
 
         // Create a set of constraints to infer a precise type for `T`.
+        let constraints = ConstraintSetBuilder::new();
         let mut builder = SpecializationBuilder::new(self.db(), &constraints, inferable);
 
         for elt_ty in elt_tys.clone() {

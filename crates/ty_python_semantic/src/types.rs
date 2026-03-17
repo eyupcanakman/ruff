@@ -1812,13 +1812,11 @@ impl<'db> Type<'db> {
     where
         F: FnMut(BoundTypeVarInstance<'db>, Type<'db>, TypeVarVariance, TypeContext<'db>),
     {
-        let constraints = ConstraintSetBuilder::new();
         self.visit_specialization_impl(
             db,
             tcx,
             TypeVarVariance::Covariant,
             &mut f,
-            &constraints,
             &SpecializationVisitor::default(),
         );
     }
@@ -1829,44 +1827,24 @@ impl<'db> Type<'db> {
         tcx: TypeContext<'db>,
         polarity: TypeVarVariance,
         f: &mut dyn FnMut(BoundTypeVarInstance<'db>, Type<'db>, TypeVarVariance, TypeContext<'db>),
-        constraints: &ConstraintSetBuilder<'db>,
         visitor: &SpecializationVisitor<'db>,
     ) {
         let Type::NominalInstance(instance) = self else {
             match self {
                 Type::Union(union) => {
                     for element in union.elements(db) {
-                        element.visit_specialization_impl(
-                            db,
-                            tcx,
-                            polarity,
-                            f,
-                            constraints,
-                            visitor,
-                        );
+                        element.visit_specialization_impl(db, tcx, polarity, f, visitor);
                     }
                 }
                 Type::Intersection(intersection) => {
                     for element in intersection.positive(db) {
-                        element.visit_specialization_impl(
-                            db,
-                            tcx,
-                            polarity,
-                            f,
-                            constraints,
-                            visitor,
-                        );
+                        element.visit_specialization_impl(db, tcx, polarity, f, visitor);
                     }
                 }
                 Type::TypeAlias(alias) => visitor.visit(self, || {
-                    alias.value_type(db).visit_specialization_impl(
-                        db,
-                        tcx,
-                        polarity,
-                        f,
-                        constraints,
-                        visitor,
-                    );
+                    alias
+                        .value_type(db)
+                        .visit_specialization_impl(db, tcx, polarity, f, visitor);
                 }),
                 _ => {}
             }
@@ -1890,8 +1868,9 @@ impl<'db> Type<'db> {
             .annotation
             .and_then(|tcx| {
                 let alias_instance = Type::instance(db, class_literal.identity_specialization(db));
-                let set = alias_instance.when_constraint_set_assignable_to(db, tcx, constraints);
-                match set.solutions(db, constraints) {
+                let set = alias_instance.when_constraint_set_assignable_to_owned(db, tcx);
+                let solutions = set.query(|constraints, set| set.solutions(db, constraints));
+                match solutions {
                     Solutions::Constrained(solutions) => {
                         let mut mappings = FxHashMap::default();
                         for solution in solutions {
@@ -1922,7 +1901,7 @@ impl<'db> Type<'db> {
             f(type_var, *ty, variance, narrowed_tcx);
 
             visitor.visit(*ty, || {
-                ty.visit_specialization_impl(db, narrowed_tcx, variance, f, constraints, visitor);
+                ty.visit_specialization_impl(db, narrowed_tcx, variance, f, visitor);
             });
         }
     }
