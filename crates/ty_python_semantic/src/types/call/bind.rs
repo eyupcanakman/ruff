@@ -3755,34 +3755,32 @@ impl<'a, 'db> ArgumentTypeChecker<'a, 'db> {
                 tcx.filter_union(self.db, |ty| ty.class_specialization(self.db).is_some())
                     .class_specialization(self.db)?;
 
-                let set = return_ty.when_constraint_set_assignable_to_owned(self.db, tcx);
+                // XXX: inferable?
+                let path_bounds = return_ty.assignable_solutions(self.db, tcx);
 
                 // Use `solutions_with` to determine per-typevar variance from the raw
                 // lower/upper bounds on each BDD path.
                 let mut variance_map: FxHashMap<BoundTypeVarIdentity<'_>, TypeVarVariance> =
                     FxHashMap::default();
-                let solutions = set.query(|constraints, set| {
-                    set.solutions_with_inferable(
-                        self.db,
-                        constraints,
-                        self.inferable_typevars,
-                        |typevar, lower, upper| {
-                            let variance = if lower.is_never() {
-                                TypeVarVariance::Covariant
-                            } else if upper == Type::object() {
-                                TypeVarVariance::Contravariant
-                            } else {
-                                TypeVarVariance::Invariant
-                            };
-                            let identity = typevar.identity(self.db);
-                            variance_map
-                                .entry(identity)
-                                .and_modify(|current| *current = current.join(variance))
-                                .or_insert(variance);
-                            None // Use default solution selection
-                        },
-                    )
-                });
+                let solutions = path_bounds.solutions_with_inferable(
+                    self.db,
+                    self.inferable_typevars,
+                    |typevar, lower, upper| {
+                        let variance = if lower.is_never() {
+                            TypeVarVariance::Covariant
+                        } else if upper == Type::object() {
+                            TypeVarVariance::Contravariant
+                        } else {
+                            TypeVarVariance::Invariant
+                        };
+                        let identity = typevar.identity(self.db);
+                        variance_map
+                            .entry(identity)
+                            .and_modify(|current| *current = current.join(variance))
+                            .or_insert(variance);
+                        None // Use default solution selection
+                    },
+                );
 
                 let Solutions::Constrained(solutions) = solutions else {
                     return None;

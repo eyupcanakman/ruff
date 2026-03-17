@@ -1868,9 +1868,8 @@ impl<'db> Type<'db> {
             .annotation
             .and_then(|tcx| {
                 let alias_instance = Type::instance(db, class_literal.identity_specialization(db));
-                let set = alias_instance.when_constraint_set_assignable_to_owned(db, tcx);
-                let solutions = set.query(|constraints, set| set.solutions(db, constraints));
-                match solutions {
+                let path_bounds = alias_instance.assignable_solutions(db, tcx);
+                match path_bounds.solutions(db) {
                     Solutions::Constrained(solutions) => {
                         let mut mappings = FxHashMap::default();
                         for solution in solutions {
