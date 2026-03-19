@@ -2823,7 +2823,6 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     ) -> Type<'db> {
         let value = assignment.value(self.module());
         let target = assignment.target(self.module());
-        let tcx = tcx.with_definition(definition);
 
         let mut target_ty = match assignment.target_kind() {
             TargetKind::Sequence(unpack_position, unpack) => {
@@ -4182,7 +4181,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             let inferred_ty = self.infer_maybe_standalone_expression(
                 value,
-                TypeContext::new(Some(declared.inner_type())).with_definition(definition),
+                TypeContext::new(Some(declared.inner_type())),
             );
 
             self.typevar_binding_context = previous_typevar_binding_context;
@@ -5900,7 +5899,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut infer_elt_ty =
             |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
 
-        self.infer_collection_literal(KnownClass::List, &elts, &mut infer_elt_ty, tcx)
+        self.infer_collection_literal(list.into(), KnownClass::List, &elts, &mut infer_elt_ty, tcx)
             .unwrap_or_else(|| {
                 KnownClass::List.to_specialized_instance(self.db(), &[Type::unknown()])
             })
@@ -5917,7 +5916,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut infer_elt_ty =
             |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
 
-        self.infer_collection_literal(KnownClass::Set, &elts, &mut infer_elt_ty, tcx)
+        self.infer_collection_literal(set.into(), KnownClass::Set, &elts, &mut infer_elt_ty, tcx)
             .unwrap_or_else(|| {
                 KnownClass::Set.to_specialized_instance(self.db(), &[Type::unknown()])
             })
@@ -6010,11 +6009,16 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                 .unwrap_or_else(|| builder.infer_expression(elt, tcx))
         };
 
-        self.infer_collection_literal(KnownClass::Dict, &items, &mut infer_elt_ty, tcx)
-            .unwrap_or_else(|| {
-                KnownClass::Dict
-                    .to_specialized_instance(self.db(), &[Type::unknown(), Type::unknown()])
-            })
+        self.infer_collection_literal(
+            dict.into(),
+            KnownClass::Dict,
+            &items,
+            &mut infer_elt_ty,
+            tcx,
+        )
+        .unwrap_or_else(|| {
+            KnownClass::Dict.to_specialized_instance(self.db(), &[Type::unknown(), Type::unknown()])
+        })
     }
 
     fn infer_typed_dict_expression(
@@ -6062,6 +6066,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     // Infer the type of a collection literal expression.
     fn infer_collection_literal<'expr, const N: usize>(
         &mut self,
+        collection: ast::ExprRef<'_>,
         collection_class: KnownClass,
         elts: &[[Option<&'expr ast::Expr>; N]],
         infer_elt_expression: &mut dyn FnMut(&mut Self, ArgExpr<'db, 'expr>) -> Type<'db>,
@@ -6080,6 +6085,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             // Attempt to infer the collection literal using the narrowed type context.
             let inferred_ty = speculative_builder.infer_collection_literal_impl(
+                collection,
                 collection_class,
                 elts,
                 infer_elt_expression,
@@ -6106,12 +6112,19 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
             }
         }
 
-        self.infer_collection_literal_impl(collection_class, elts, infer_elt_expression, tcx)
+        self.infer_collection_literal_impl(
+            collection,
+            collection_class,
+            elts,
+            infer_elt_expression,
+            tcx,
+        )
     }
 
     // Infer the type of a collection literal expression.
     fn infer_collection_literal_impl<'expr, const N: usize>(
         &mut self,
+        collection: ast::ExprRef<'_>,
         collection_class: KnownClass,
         elts: &[[Option<&'expr ast::Expr>; N]],
         infer_elt_expression: &mut dyn FnMut(&mut Self, ArgExpr<'db, 'expr>) -> Type<'db>,
@@ -6237,7 +6250,12 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         }
 
         if tcx.annotation.is_none()
-            && let Some(definition) = tcx.definition
+            && let InferenceRegion::Expression(expr, _) = self.region
+            && expr.node_ref(self.db(), self.module()).node_index() == collection.node_index()
+            && let Some(assignment) = expr.assigned_to(self.db())
+            // TODO: Handle multi-target assignments.
+            && let [target] = assignment.node(self.module()).targets.as_slice()
+            && let Some(definition) = self.index.try_definition(NodeKey::from_node(target))
         {
             // For unannotated collection literals, collect any constraints created by later uses
             // of this definition in the scope.
@@ -6458,6 +6476,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
     /// element / key-value types from the comprehension expression.
     fn infer_comprehension_specialization<const N: usize>(
         &mut self,
+        collection: ast::ExprRef<'_>,
         collection_class: KnownClass,
         elements: [Option<&ast::Expr>; N],
         inference: &ScopeInference<'db>,
@@ -6466,7 +6485,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let mut infer_element_ty =
             |_builder: &mut Self, (_, elt, _)| inference.expression_type(elt);
 
-        self.infer_collection_literal(collection_class, &[elements], &mut infer_element_ty, tcx)
+        self.infer_collection_literal(
+            collection,
+            collection_class,
+            &[elements],
+            &mut infer_element_ty,
+            tcx,
+        )
     }
 
     fn infer_list_comprehension_expression(
@@ -6493,10 +6518,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let inference = infer_scope_types(self.db(), scope, tcx);
         self.extend_scope(inference);
 
-        self.infer_comprehension_specialization(KnownClass::List, [Some(elt)], inference, tcx)
-            .unwrap_or_else(|| {
-                KnownClass::List.to_specialized_instance(self.db(), &[Type::unknown()])
-            })
+        self.infer_comprehension_specialization(
+            listcomp.into(),
+            KnownClass::List,
+            [Some(elt)],
+            inference,
+            tcx,
+        )
+        .unwrap_or_else(|| KnownClass::List.to_specialized_instance(self.db(), &[Type::unknown()]))
     }
 
     fn infer_set_comprehension_expression(
@@ -6523,10 +6552,14 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let inference = infer_scope_types(self.db(), scope, tcx);
         self.extend_scope(inference);
 
-        self.infer_comprehension_specialization(KnownClass::Set, [Some(elt)], inference, tcx)
-            .unwrap_or_else(|| {
-                KnownClass::Set.to_specialized_instance(self.db(), &[Type::unknown()])
-            })
+        self.infer_comprehension_specialization(
+            setcomp.into(),
+            KnownClass::Set,
+            [Some(elt)],
+            inference,
+            tcx,
+        )
+        .unwrap_or_else(|| KnownClass::Set.to_specialized_instance(self.db(), &[Type::unknown()]))
     }
 
     fn infer_dict_comprehension_expression(
@@ -6555,6 +6588,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         self.extend_scope(inference);
 
         self.infer_comprehension_specialization(
+            dictcomp.into(),
             KnownClass::Dict,
             [Some(key), Some(value)],
             inference,
@@ -6594,7 +6628,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let elts = [[Some(elt.as_ref())]];
         let mut infer_elt_ty =
             |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
-        self.infer_collection_literal(KnownClass::List, &elts, &mut infer_elt_ty, tcx);
+        self.infer_collection_literal(
+            listcomp.into(),
+            KnownClass::List,
+            &elts,
+            &mut infer_elt_ty,
+            tcx,
+        );
 
         self.infer_comprehensions(generators);
     }
@@ -6615,7 +6655,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let elts = [[Some(elt.as_ref())]];
         let mut infer_elt_ty =
             |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
-        self.infer_collection_literal(KnownClass::Set, &elts, &mut infer_elt_ty, tcx);
+        self.infer_collection_literal(
+            setcomp.into(),
+            KnownClass::Set,
+            &elts,
+            &mut infer_elt_ty,
+            tcx,
+        );
 
         self.infer_comprehensions(generators);
     }
@@ -6637,7 +6683,13 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
         let elts = [[Some(key.as_ref()), Some(value.as_ref())]];
         let mut infer_elt_ty =
             |builder: &mut Self, (_, elt, tcx)| builder.infer_expression(elt, tcx);
-        self.infer_collection_literal(KnownClass::Dict, &elts, &mut infer_elt_ty, tcx);
+        self.infer_collection_literal(
+            dictcomp.into(),
+            KnownClass::Dict,
+            &elts,
+            &mut infer_elt_ty,
+            tcx,
+        );
 
         self.infer_comprehensions(generators);
     }
