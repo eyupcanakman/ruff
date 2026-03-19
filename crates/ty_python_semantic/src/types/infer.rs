@@ -36,7 +36,8 @@
 //! of iterations, so if we fail to converge, Salsa will eventually panic. (This should of course
 //! be considered a bug.)
 
-use std::{iter, slice};
+use std::collections::hash_map::Entry;
+use std::iter;
 
 use itertools::Either;
 use ruff_db::parsed::{ParsedModuleRef, parsed_module};
@@ -567,7 +568,7 @@ struct ScopeInferenceExtra<'db> {
     string_annotations: FxHashSet<ExpressionNodeKey>,
 
     /// The type contexts applicable to every definition in this region.
-    use_contexts: FxHashMap<Definition<'db>, Vec<Type<'db>>>,
+    use_contexts: FxHashMap<Definition<'db>, FxHashSet<Type<'db>>>,
 
     /// The fallback type for missing expressions/bindings/declarations or recursive type inference.
     cycle_recovery: Option<Type<'db>>,
@@ -599,8 +600,23 @@ impl<'db> ScopeInference<'db> {
         }
 
         if let Some(extra) = &mut self.extra {
-            for ty in extra.use_contexts.values_mut().flatten() {
-                *ty = ty.recursive_type_normalized(db, cycle);
+            for types in &mut extra.use_contexts.values_mut() {
+                *types = types
+                    .iter()
+                    .map(|ty| ty.recursive_type_normalized(db, cycle))
+                    .collect();
+            }
+        }
+        if let Some(prev_extra) = &previous_inference.extra {
+            for (def, prev_types) in &prev_extra.use_contexts {
+                let extra = self.extra.get_or_insert_default();
+
+                match extra.use_contexts.entry(*def) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(prev_types.clone());
+                    }
+                    Entry::Occupied(mut entry) => entry.get_mut().extend(prev_types),
+                }
             }
         }
 
@@ -624,15 +640,10 @@ impl<'db> ScopeInference<'db> {
             return Either::Left(iter::empty());
         };
 
-        match extra
-            .use_contexts
-            .get(&definition)
-            .map(Vec::as_slice)
-            .or_else(|| extra.cycle_recovery.as_ref().map(slice::from_ref))
-        {
-            None => Either::Left(iter::empty()),
+        Either::Right(match extra.use_contexts.get(&definition) {
+            None => Either::Left(extra.cycle_recovery.into_iter()),
             Some(types) => Either::Right(types.iter().copied()),
-        }
+        })
     }
 
     pub(crate) fn try_expression_type(
@@ -696,7 +707,7 @@ struct DefinitionInferenceExtra<'db> {
     called_functions: Box<[FunctionType<'db>]>,
 
     /// The type contexts applicable to every definition in this region.
-    use_contexts: FxHashMap<Definition<'db>, Vec<Type<'db>>>,
+    use_contexts: FxHashMap<Definition<'db>, FxHashSet<Type<'db>>>,
 
     /// The fallback type for missing expressions/bindings/declarations or recursive type inference.
     cycle_recovery: Option<Type<'db>>,
@@ -764,8 +775,23 @@ impl<'db> DefinitionInference<'db> {
             }
         }
         if let Some(extra) = &mut self.extra {
-            for ty in extra.use_contexts.values_mut().flatten() {
-                *ty = ty.recursive_type_normalized(db, cycle);
+            for types in &mut extra.use_contexts.values_mut() {
+                *types = types
+                    .iter()
+                    .map(|ty| ty.recursive_type_normalized(db, cycle))
+                    .collect();
+            }
+        }
+        if let Some(prev_extra) = &previous_inference.extra {
+            for (def, prev_types) in &prev_extra.use_contexts {
+                let extra = self.extra.get_or_insert_default();
+
+                match extra.use_contexts.entry(*def) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(prev_types.clone());
+                    }
+                    Entry::Occupied(mut entry) => entry.get_mut().extend(prev_types),
+                }
             }
         }
 
@@ -864,7 +890,7 @@ struct ExpressionInferenceExtra<'db> {
     string_annotations: FxHashSet<ExpressionNodeKey>,
 
     /// The type contexts applicable to every definition in this region.
-    use_contexts: FxHashMap<Definition<'db>, Vec<Type<'db>>>,
+    use_contexts: FxHashMap<Definition<'db>, FxHashSet<Type<'db>>>,
 
     /// The types of every binding in this expression region.
     ///
@@ -916,8 +942,23 @@ impl<'db> ExpressionInference<'db> {
                 }
             }
 
-            for ty in extra.use_contexts.values_mut().flatten() {
-                *ty = ty.recursive_type_normalized(db, cycle);
+            for types in &mut extra.use_contexts.values_mut() {
+                *types = types
+                    .iter()
+                    .map(|ty| ty.recursive_type_normalized(db, cycle))
+                    .collect();
+            }
+            if let Some(prev_extra) = &previous.extra {
+                for (def, prev_types) in &prev_extra.use_contexts {
+                    let extra = self.extra.get_or_insert_default();
+
+                    match extra.use_contexts.entry(*def) {
+                        Entry::Vacant(entry) => {
+                            entry.insert(prev_types.clone());
+                        }
+                        Entry::Occupied(mut entry) => entry.get_mut().extend(prev_types),
+                    }
+                }
             }
         }
 

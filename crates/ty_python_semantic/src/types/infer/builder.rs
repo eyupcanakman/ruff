@@ -215,7 +215,7 @@ pub(super) struct TypeInferenceBuilder<'db, 'ast> {
     expressions: FxHashMap<ExpressionNodeKey, Type<'db>>,
 
     /// The type contexts applicable to every definition in this region.
-    use_contexts: FxHashMap<Definition<'db>, Vec<Type<'db>>>,
+    use_contexts: FxHashMap<Definition<'db>, FxHashSet<Type<'db>>>,
 
     /// Expressions that are string annotations
     string_annotations: FxHashSet<ExpressionNodeKey>,
@@ -5390,7 +5390,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                 self.use_contexts
                                     .entry(definition)
                                     .or_default()
-                                    .push(parameter_constraint);
+                                    .insert(parameter_constraint);
                             }
                         }
                     }
@@ -5586,7 +5586,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
 
             for binding in use_def.bindings_at_use(use_id) {
                 if let Some(definition) = binding.binding.definition() {
-                    self.use_contexts.entry(definition).or_default().push(tcx);
+                    self.use_contexts.entry(definition).or_default().insert(tcx);
                 }
             }
         }
@@ -7465,7 +7465,7 @@ impl<'db, 'ast> TypeInferenceBuilder<'db, 'ast> {
                                         self.use_contexts
                                             .entry(definition)
                                             .or_default()
-                                            .push(constraints);
+                                            .insert(constraints);
                                     }
                                 }
                             }
